@@ -1,3 +1,5 @@
+import numpy as np
+
 from interface import *
 
 
@@ -21,7 +23,7 @@ class SGD(Optimizer):
                 :return: np.array, new parameter values
             """
             # your code here \/
-            return ...
+            return parameter - self.lr * parameter_grad
             # your code here /\
 
         return updater
@@ -48,7 +50,7 @@ class SGDMomentum(Optimizer):
                 :return: np.array, new parameter values
             """
             # your code here \/
-            return ...
+            return parameter - self.momentum * parameter - self.lr * parameter_grad
             # your code here /\
 
         updater.inertia = np.zeros(parameter_shape)
@@ -67,7 +69,7 @@ class ReLU(Layer):
                 ... - arbitrary shape (the same for input and output)
         """
         # your code here \/
-        return ...
+        return np.where(inputs >= 0, inputs, 0)
         # your code here /\
 
     def backward_impl(self, grad_outputs):
@@ -80,7 +82,7 @@ class ReLU(Layer):
                 ... - arbitrary shape (the same for input and output)
         """
         # your code here \/
-        return ...
+        return grad_outputs * np.where(self.forward_inputs >= 0, 1, 0)
         # your code here /\
 
 
@@ -96,7 +98,8 @@ class Softmax(Layer):
                 d - number of units
         """
         # your code here \/
-        return ...
+        norm_input = inputs - np.max(inputs, axis=1)[:, None]
+        return np.exp(norm_input) / np.sum(np.exp(norm_input), axis=1)[:, None]
         # your code here /\
 
     def backward_impl(self, grad_outputs):
@@ -109,7 +112,13 @@ class Softmax(Layer):
                 d - number of units
         """
         # your code here \/
-        return ...
+        n, d = grad_outputs.shape
+        grad = np.zeros((n, d, d))
+        di = np.diag_indices(d)
+        for i in range(n):
+            grad[i, di] = self.forward_outputs[i]
+            grad[i, :] -= np.dot(self.forward_outputs[i][None, :], self.forward_outputs[i][None, :].T)
+        return grad
         # your code here /\
 
 
