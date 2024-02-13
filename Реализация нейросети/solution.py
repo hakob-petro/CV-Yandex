@@ -561,7 +561,8 @@ class BatchNorm(Layer):
         """
         # your code here \/
         scaled_grad = self.gamma[..., None, None] * grad_outputs
-        scale_coef = 0.5 * self.forward_inputs[0] * self.forward_inputs[2] * self.forward_inputs[3] + 1e-8
+        b, d, h, w = self.forward_inputs.shape
+        scale_coef = 0.5 * b * h * w + 1e-8
 
         var_grad = -0.5 * self.forward_inverse_std ** 3 * np.sum(scaled_grad * self.forward_centered_inputs, axis=(0, 2, 3))[..., None, None]
 
@@ -662,33 +663,27 @@ def train_cifar10_model(x_train, y_train, x_valid, y_valid):
 
     # 2) Add layers to the model
     #   (don't forget to specify the input shape for the first layer)
-    model.add(Conv2D(8, 3, (3, 32, 32)))
+    model.add(Conv2D(6, 3, (3, 32, 32)))
     model.add(ReLU())
     model.add(BatchNorm())
+    model.add(Pooling2D(2, 'max'))
+    model.add(Conv2D(16, 3))
+    model.add(ReLU())
+    model.add(BatchNorm())
+    model.add(Conv2D(16, 3))
+    model.add(ReLU())
+    model.add(BatchNorm())
+    model.add(Pooling2D(2, 'max'))
     model.add(Conv2D(8, 3))
-    model.add(ReLU())
-    model.add(BatchNorm())
-    model.add(Pooling2D(2, 'max'))
-    model.add(Conv2D(16, 3))
-    model.add(ReLU())
-    model.add(BatchNorm())
-    model.add(Conv2D(32, 3))
-    model.add(ReLU())
-    model.add(BatchNorm())
-    model.add(Pooling2D(2, 'max'))
-    model.add(Conv2D(32, 3))
-    model.add(ReLU())
-    model.add(BatchNorm())
-    model.add(Conv2D(16, 3))
     model.add(ReLU())
     model.add(BatchNorm())
     model.add(Pooling2D(2, 'max'))
     model.add(Flatten())
     model.add(Dropout(0.2))
-    model.add(Dense(1024))
+    model.add(Dense(512))
     model.add(ReLU())
     model.add(Dropout(0.2))
-    model.add(Dense(1024))
+    model.add(Dense(84))
     model.add(ReLU())
     model.add(Dense(10))
     model.add(Softmax())
@@ -696,7 +691,7 @@ def train_cifar10_model(x_train, y_train, x_valid, y_valid):
     print(model)
 
     # 3) Train and validate the model using the provided data
-    model.fit(x_train, y_train, batch_size=32, epochs=10, x_valid=x_valid, y_valid=y_valid)
+    model.fit(x_train, y_train, batch_size=32, epochs=3, x_valid=x_valid, y_valid=y_valid)
 
     # your code here /\
     return model
