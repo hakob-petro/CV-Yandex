@@ -37,8 +37,8 @@ def print_trainable_parameters(model: torch.nn.Module) -> None:
 class FacePointDataset(Dataset):
     def __init__(self,
                  img_dir: str,
-                 coords_file: str,
                  input_shape: Tuple[int, ...],
+                 coords_file: Optional[str] = None,
                  mode: Literal["training", "validation", "inference"] = "training",
                  transform: Optional = None,
                  split: float = 0.01,
@@ -114,7 +114,7 @@ class FacePointDataset(Dataset):
             scale_coeffs = (image.shape[0] / self.input_shape[0], image.shape[1] / self.input_shape[1])
             image, _ = self._resize_input(image)
             image = self.normalize_transform(image=image)["image"]
-            return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), self.img_names[i], scale_coeffs
+            return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), scale_coeffs
 
 
 class BottleneckResidualBlock(nn.Module):
@@ -345,7 +345,9 @@ def load_checkpoint(model: torch.nn.Module,
         return model, optimizer, 0, torch.inf
 
     checkpoint = torch.load(CHECKPOINT_FILE)
+    model.to("cpu")
     model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(DEVICE)
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']
@@ -368,7 +370,8 @@ def train_detector(train_img_dir: str,
     model = CustomResNet([2, 2, 2, 2]).to(DEVICE)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=7)
+    # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=5)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.5, step_size=30)
 
     if fast_train:
         enable_checkpointning = False
@@ -445,9 +448,33 @@ def train_detector(train_img_dir: str,
                     wandb.log({"Average val error per epoch": sum(val_errors) / len(val_errors)}, step=batch_ct + 1)
                 print("AVERAGE VALIADTION ERROR: {:.4f}".format(sum(val_errors) / len(val_errors)))
 
-        lr_scheduler.step(loss)
+        lr_scheduler.step(sum(val_errors) / len(val_errors))
         if enable_logging:
             wandb.log({"lr": optimizer.param_groups[0]["lr"]})
+
+
+def detect(test_img_dir: str, input_shape: Tuple[int, int] = (100, 100), batch_size: int = 1):
+    model = CustomResNet([2, 2, 2, 2])
+    checkpoint = torch.load(CHECKPOINT_FILE)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(DEVICE)
+
+    inference_dataset = FacePointDataset(mode="inference", input_shape=input_shape, img_dir=test_img_dir)
+    inference_dataloader = DataLoader(inference_dataset, batch_size=batch_size, shuffle=False, num_workers=os.cpu_count())
+
+    model.eval()
+
+    preds = {}
+    with torch.no_grad():
+        for i, (img, scale_coeffs) in enumerate(inference_dataloader):
+            img = img.to(DEVICE)
+            coords = model(img)
+            coords = coords.to("cpu")
+            coords[:, 0::2] *= scale_coeffs[:, 0]
+            coords[:, 1::2] *= scale_coeffs[:, 1]
+            for j in range(batch_size):
+                preds[inference_dataset.img_names[i * batch_size + j]] = coords[j].numpy()
+    return preds
 
 
 if __name__ == "__main__":
@@ -457,12 +484,13 @@ if __name__ == "__main__":
     wandb.init(
         project="FacePoints",
         resume="allow",
+        name="lr_3e-2_b_32_steplr"
     )
 
     train_detector(train_img_dir=r"./data/00_test_img_input/train/images",
                    coords_file=r"./data/00_test_img_input/train/gt.csv",
                    input_shape=(100, 100),
-                   batch_size=32,
+                   batch_size=64,
                    lr=3e-2,
                    num_epochs=100,
                    fast_train=False,
