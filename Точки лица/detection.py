@@ -1,5 +1,6 @@
 import os
 import random
+from pathlib import Path
 from typing import Tuple, Literal, Optional, Callable
 
 import cv2
@@ -17,42 +18,68 @@ torch.manual_seed(hash("by removing stochasticity") % 2 ** 32 - 1)
 torch.cuda.manual_seed_all(hash("so runs are repeatable") % 2 ** 32 - 1)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-CHECKPOINT_NAME = "model.pt"
+CHECKPOINT_FILE = Path(os.path.join(os.path.abspath(os.path.dirname(__file__)), "facepoints_model.pt"))
+
+
+def print_trainable_parameters(model: torch.nn.Module) -> None:
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        num_params = param.numel()
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+    print(
+        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
+    )
 
 
 class FacePointDataset(Dataset):
-    def __init__(self, img_dir: str, coords_file: str, input_shape: Tuple[int, ...],
-                 mode: Literal["training", "validation", "inference"] = "training", transform: Optional = None,
-                 train_val_split: float = 0.8, fast_train: bool = False, fast_train_val_split: float = 0.01):
+    def __init__(self,
+                 img_dir: str,
+                 coords_file: str,
+                 input_shape: Tuple[int, ...],
+                 mode: Literal["training", "validation", "inference"] = "training",
+                 transform: Optional = None,
+                 split: float = 0.01,
+                 fast_train: bool = False,
+                 ):
         self.img_dir = img_dir
-        self.img_paths = sorted(os.listdir(img_dir))
+        self.img_names = sorted(os.listdir(img_dir))
+
         self.transform = transform
+        self.normalize_transform = A.Compose([A.Normalize(always_apply=True)])
+
         self.input_shape = input_shape
         self.coords = dict()
         self.mode = mode
 
-        if mode != "inference":
+        if mode in ["training", "validation"]:
             with open(coords_file) as f:
-                next(f)  # to skip first row
+                next(f)  # skip first row
                 for line in f:
                     parts = line.rstrip('\n').split(',')
                     coords = [float(x) for x in parts[1:]]
                     coords = np.array(coords, dtype=np.float32)
                     self.coords.update({parts[0]: coords})
 
-        if fast_train:
-            self.img_names = self.img_paths[: int(fast_train_val_split * len(self.img_paths))]
-        elif mode:
-            self.img_names = self.img_paths[: int(train_val_split * len(self.img_paths))]
-        else:
-            self.img_names = self.img_paths[int(train_val_split * len(self.img_paths)):]
+        if mode == "training":
+            self.img_names = self.img_names[: int(split * len(self.img_names))]
+        elif mode == "validation":
+            if fast_train:
+                self.img_names = self.img_names[int((1 - split) * len(self.img_names)):]
+            self.img_names = self.img_names[int(split * len(self.img_names)):]
 
     def __len__(self):
         return len(self.img_names)
 
-    def _resize_image_and_coords(self, image: np.ndarray, curr_coords: Optional[np.ndarray] = None) -> Tuple[
-        torch.TensorType, Optional[np.ndarray]]:
-        if self.mode != "inference":
+    def _resize_input(
+            self,
+            image: np.ndarray,
+            curr_coords: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+
+        if self.mode in ["training", "validation"]:
             curr_coords[0::2] *= self.input_shape[0] / image.shape[0]
             curr_coords[1::2] *= self.input_shape[1] / image.shape[1]
 
@@ -60,44 +87,51 @@ class FacePointDataset(Dataset):
             image = cv2.resize(image, self.input_shape, interpolation=cv2.INTER_CUBIC)
         else:
             image = cv2.resize(image, self.input_shape, interpolation=cv2.INTER_AREA)
-
-        return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), curr_coords
+        return image, curr_coords
 
     def __getitem__(self, i):
-        image: np.ndarray = cv2.imread(os.path.join(self.img_dir, self.img_paths[i]), cv2.IMREAD_COLOR)
-        image: np.ndarray = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # uint8 image
+        image: np.ndarray = cv2.imread(os.path.join(self.img_dir, self.img_names[i]), cv2.IMREAD_COLOR)
+        image: np.ndarray = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        if self.mode != "inference":
-            curr_coords = self.coords[self.img_paths[i].split("\\")[-1].rstrip('\n')].copy()
+        assert image.dtype == np.uint8
 
-            # Transforms can be applied only for training and validation
+        if self.mode in ["training", "validation"]:
+            coords = self.coords[self.img_names[i]].copy()
+
+            # First resize, then apply transformations
+            image, coords = self._resize_input(image, coords)
+
             if self.transform:
-                transform_res = self.transform(image=image, keypoints=curr_coords.reshape(-1, 2))
-                transformed_coords = np.array(transform_res["keypoints"], dtype=np.float32).flatten()
-                if len(curr_coords) == len(
-                        transformed_coords):  # Or we can process images with wrong coords separatly in collate_fn
-                    curr_coords = transformed_coords
+                transform_res = self.transform(image=image, keypoints=coords.reshape(-1, 2))
+                transform_coords = np.array(transform_res["keypoints"], dtype=np.float32)
+                if len(coords) == transform_coords.size:
+                    coords = transform_coords.flatten()
                     image = transform_res["image"]
-            image, curr_coords = self._resize_image_and_coords(image, curr_coords)
-            return image, curr_coords
+
+            image = self.normalize_transform(image=image)["image"]
+            return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), torch.from_numpy(coords)
         else:
-            scale_coefs = (image.shape[0] / self.input_shape[0], image.shape[1] / self.input_shape[1])
-            image, _ = self._resize_image_and_coords(image)
-            return image, self.img_paths[i], scale_coefs
+            scale_coeffs = (image.shape[0] / self.input_shape[0], image.shape[1] / self.input_shape[1])
+            image, _ = self._resize_input(image)
+            image = self.normalize_transform(image=image)["image"]
+            return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), self.img_names[i], scale_coeffs
 
 
 class BottleneckResidualBlock(nn.Module):
     expansion: int = 4
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1,
-                 skip_connection: Optional[nn.Module] = None,
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 stride: int = 1,
+                 downsample: Optional[nn.Module] = None,
                  norm_layer: Optional[Callable[..., nn.Module]] = None) -> None:
         super(BottleneckResidualBlock, self).__init__()
 
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
 
-        self.skip_connection = skip_connection
+        self.downsample = downsample
         self.stride = stride
 
         self.conv_1 = nn.Sequential(
@@ -123,47 +157,60 @@ class BottleneckResidualBlock(nn.Module):
         out = self.conv_2(out)
         out = self.conv_3(out)
 
-        if self.skip_connection is not None:
-            residual = self.skip_connection(x)
+        if self.downsample is not None:
+            residual = self.downsample(x)
 
         out += residual
         out = self.gelu(out)
         return out
 
 
-class ResNet(nn.Module):
-    def __init__(self, layers, num_points: int = 28, norm_layer: Optional[Callable[..., nn.Module]] = None,
+class CustomResNet(nn.Module):
+    def __init__(self,
+                 layers, num_points: int = 28,
+                 norm_layer: Optional[Callable[..., nn.Module]] = None,
                  init_residual: bool = False) -> None:
-        super(ResNet, self).__init__()
+        super(CustomResNet, self).__init__()
 
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
-        self.norm_layer = norm_layer
 
+        self.norm_layer = norm_layer
         self.in_planes = 64
+
         self.conv_1 = nn.Sequential(
             nn.Conv2d(3, self.in_planes, kernel_size=7, stride=2, padding=3),
             norm_layer(self.in_planes),
-            nn.GELU())
+            nn.GELU()
+        )
         self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
         self.layer_0 = self._make_layer(64, layers[0], stride=1)
         self.layer_1 = self._make_layer(128, layers[1], stride=2)
         self.layer_2 = self._make_layer(256, layers[2], stride=2)
         self.layer_3 = self._make_layer(512, layers[3], stride=2)
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
         self.fc = nn.Sequential(
-            nn.Linear(512 * BottleneckResidualBlock.expansion, 512 * BottleneckResidualBlock.expansion),
+            nn.Linear(512 * BottleneckResidualBlock.expansion, 512),
+            nn.BatchNorm1d(512),
             nn.GELU(),
-            nn.Dropout(),
-            nn.Linear(512 * BottleneckResidualBlock.expansion, num_points)
+            nn.Dropout(p=0.2),
+            nn.Linear(512, num_points)
         )
-        self.__init_layers()
+
+        self.__init_layers(init_residual)
 
     def _make_layer(self, planes, blocks, stride=1):
-        skip_connection = None
+        downsample = None
         if stride != 1 or self.in_planes != planes * BottleneckResidualBlock.expansion:
-            skip_connection = nn.Sequential(
-                nn.Conv2d(self.in_planes, planes * BottleneckResidualBlock.expansion, kernel_size=1, stride=stride),
+            downsample = nn.Sequential(
+                nn.Conv2d(
+                    self.in_planes,
+                    planes * BottleneckResidualBlock.expansion,
+                    kernel_size=1,
+                    stride=stride
+                ),
                 self.norm_layer(planes * BottleneckResidualBlock.expansion),
             )
 
@@ -172,7 +219,7 @@ class ResNet(nn.Module):
                 in_channels=self.in_planes,
                 out_channels=planes,
                 stride=stride,
-                skip_connection=skip_connection,
+                downsample=downsample,
                 norm_layer=self.norm_layer
             )
         ]
@@ -190,6 +237,9 @@ class ResNet(nn.Module):
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                torch.nn.init.normal_(m.bias)
 
         if init_residual:
             for m in self.modules():
@@ -209,31 +259,44 @@ class ResNet(nn.Module):
         return x
 
 
-def get_dataloaders(train_img_dir: str, coords_file: str, input_shape: Tuple[int, int] = (96, 96),
-                    batch_size: int = 64, fast_train: bool = True):
+def get_dataloaders(
+        train_img_dir: str,
+        coords_file: str,
+        input_shape: Tuple[int, int] = (96, 96),
+        batch_size: int = 64,
+        fast_train: bool = False) -> Tuple[DataLoader, DataLoader]:
+
     transforms = A.Compose([
-        A.Rotate(limit=30),
         A.OneOf([
-            A.Blur(blur_limit=2, p=0.3),
-            # A.OpticalDistortion(p=0.1, distort_limit=0.1, shift_limit=0.2),
-            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5)
-        ], p=0.3),
-        A.HorizontalFlip(p=0.2),
-        A.Equalize(p=0.2),
-        A.Normalize(always_apply=True),
-    ], keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+            A.ZoomBlur(p=0.4),
+            A.Sharpen(p=0.6),
+        ], p=0.2),
+        A.OneOf([
+            A.ColorJitter(p=0.4),
+            A.CLAHE(p=0.2),
+            A.Solarize(p=0.2),
+            A.RGBShift(r_shift_limit=12, g_shift_limit=12, b_shift_limit=12, p=0.2)
+        ], p=0.8),
+    ], p=0.8, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
     dataset_train = FacePointDataset(
-        mode="training", input_shape=input_shape,
-        img_dir=train_img_dir, coords_file=coords_file,
+        mode="training",
+        input_shape=input_shape,
+        img_dir=train_img_dir,
+        coords_file=coords_file,
         transform=transforms,
         fast_train=fast_train,
-        fast_train_val_split=0.01 if fast_train else None
+        split=0.01 if fast_train else 0.9
     )
 
     dataset_val = FacePointDataset(
-        mode="validation", input_shape=input_shape,
-        img_dir=train_img_dir, coords_file=coords_file)
+        mode="validation",
+        input_shape=input_shape,
+        img_dir=train_img_dir,
+        coords_file=coords_file,
+        fast_train=fast_train,
+        split=0.01 if fast_train else 0.9
+    )
 
     train_loader = DataLoader(
         dataset_train,
@@ -252,8 +315,8 @@ def get_dataloaders(train_img_dir: str, coords_file: str, input_shape: Tuple[int
     return train_loader, val_loader
 
 
-def scale_predict(outputs: torch.Tensor, coords: torch.Tensor, input_shape: Tuple[int, int]) -> Tuple[
-    torch.Tensor, ...]:
+def scale_predict(
+        outputs: torch.Tensor, coords: torch.Tensor, input_shape: Tuple[int, int]) -> Tuple[torch.Tensor, ...]:
     scaled_outputs = outputs.clone().detach()
     scaled_coords = coords.clone().detach()
     scaled_outputs[:, 0::2] *= 100 / input_shape[0]
@@ -263,43 +326,71 @@ def scale_predict(outputs: torch.Tensor, coords: torch.Tensor, input_shape: Tupl
     return scaled_outputs, scaled_coords
 
 
-def print_trainable_parameters(model: torch.nn.Module) -> None:
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        num_params = param.numel()
-        all_param += num_params
-        if param.requires_grad:
-            trainable_params += num_params
-    print(
-        f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
-    )
+def create_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer, loss: float, epoch: int):
+    if CHECKPOINT_FILE.is_file():
+        os.remove(CHECKPOINT_FILE)
+
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, CHECKPOINT_FILE)
 
 
-def train_detector(train_img_dir: str, coords_file: str, checkpoint_dir,
-                   input_shape: Tuple[int, int] = (96, 96),
-                   batch_size: int = 64, lr: float = 3e-4,
-                   num_epochs: int = 20, fast_train: bool = True, enable_logging: bool = False,
-                   logging_steps: int = 10, enable_checkpointning: bool = False, saving_steps: int = 50):
-    if fast_train and enable_checkpointning:
+def load_checkpoint(model: torch.nn.Module,
+                    optimizer: torch.optim.Optimizer) -> Tuple[torch.nn.Module, torch.optim.Optimizer, int, float]:
+    if not CHECKPOINT_FILE.is_file():
+        print("No checkpoints detected! Starting training from scratch!")
+        return model, optimizer, 0, torch.inf
+
+    checkpoint = torch.load(CHECKPOINT_FILE)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    return model, optimizer, epoch, loss
+
+
+def train_detector(train_img_dir: str,
+                   coords_file: str,
+                   fast_train: bool,
+                   input_shape: Tuple[int, int] = (100, 100),
+                   batch_size: int = 64,
+                   lr: float = 3e-4,
+                   num_epochs: int = 20,
+                   enable_logging: bool = False,
+                   logging_steps: int = 20,
+                   enable_checkpointning: bool = False,
+                   saving_steps: int = 50):
+    train_loader, val_loader = get_dataloaders(train_img_dir, coords_file, input_shape, batch_size, fast_train)
+
+    model = CustomResNet([2, 2, 2, 2]).to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=7)
+
+    if fast_train:
         enable_checkpointning = False
+        enable_logging = False
+        start_epoch = 0
+        num_epochs = 1
+    else:
+        print("Trying to load model and optimizer from checkpoint...")
+        model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer)
+
     if enable_logging:
         import wandb
 
-    train_loader, val_loader = get_dataloaders(train_img_dir, coords_file, input_shape, batch_size, fast_train)
-
-    model = ResNet([2, 2, 2, 2]).to(DEVICE)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=7)
-
-    print_trainable_parameters(model)
     total_step = len(train_loader)
     print(f"Total training steps: {total_step * num_epochs}")
+    print_trainable_parameters(model)
 
+    print("Start training...")
     batch_ct = 0
-    for epoch in range(num_epochs):
-        with tqdm(train_loader, unit="batch") as tqdm_epoch:
+    for epoch in range(start_epoch, num_epochs):
+        # Training
+        with tqdm(train_loader, unit="batch", leave=True) as tqdm_epoch:
             for images, coords in tqdm_epoch:
                 tqdm_epoch.set_description(f"Training epoch {epoch}")
 
@@ -308,8 +399,9 @@ def train_detector(train_img_dir: str, coords_file: str, checkpoint_dir,
 
                 # Forward
                 outputs = model(images)
-                scaled_outputs, scaled_coords = scale_predict(outputs, coords, input_shape)
                 loss = criterion(outputs, coords)
+
+                scaled_outputs, scaled_coords = scale_predict(outputs, coords, input_shape)
                 error = criterion(scaled_outputs, scaled_coords)
                 batch_ct += 1
 
@@ -317,8 +409,7 @@ def train_detector(train_img_dir: str, coords_file: str, checkpoint_dir,
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                del images, coords, outputs
-                torch.cuda.empty_cache()
+                del images, outputs, coords
 
                 if enable_logging and (batch_ct + 1) % logging_steps == 0:
                     wandb.log({
@@ -326,23 +417,20 @@ def train_detector(train_img_dir: str, coords_file: str, checkpoint_dir,
                         "Train error": error.item(),
                         "epoch": epoch
                     }, step=batch_ct + 1)
-                    print('Epoch [{}/{}], Loss: {:.4f}, Error: {:.4f}'
-                          .format(epoch + 1, num_epochs, loss.item(), error.item()))
+                    print(f''
+                          f'Epoch: [{epoch}/{num_epochs - 1}],'
+                          f' Training Loss: {loss.item():.4f},'
+                          f' Training Error: :{error.item():.4f}')
 
                 if enable_checkpointning and batch_ct % saving_steps == 0:
                     model = model.to("cpu")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': loss.item(),
-                    }, os.path.join(checkpoint_dir, CHECKPOINT_NAME))
+                    create_checkpoint(model, optimizer, loss.item(), epoch)
                     model = model.to(DEVICE)
 
         # Validation
-        with torch.no_grad(), tqdm(val_loader, unit="batch") as tqdm_val_epoch:
-            for images, coords in tqdm_val_epoch:
-                tqdm_val_epoch.set_description(f"Training epoch {epoch}")
+        with torch.no_grad():
+            val_errors = []
+            for i, (images, coords) in enumerate(val_loader):
                 images = images.to(DEVICE)
                 coords = coords.to(DEVICE)
                 outputs = model(images)
@@ -350,42 +438,34 @@ def train_detector(train_img_dir: str, coords_file: str, checkpoint_dir,
                 loss = criterion(outputs, coords)
                 error = criterion(scaled_outputs, scaled_coords)
 
+                val_errors.append(error.item())
+
+            if val_errors:
                 if enable_logging:
-                    wandb.log({
-                        "Val loss": loss.item(),
-                        "Val error": error.item(),
-                        "epoch": epoch
-                    }, step=batch_ct + 1)
-                    print('Epoch [{}/{}], Loss: {:.4f}, Error: {:.4f}'
-                          .format(epoch + 1, num_epochs, loss.item(), error.item()))
+                    wandb.log({"Average val error per epoch": sum(val_errors) / len(val_errors)}, step=batch_ct + 1)
+                print("AVERAGE VALIADTION ERROR: {:.4f}".format(sum(val_errors) / len(val_errors)))
+
+        lr_scheduler.step(loss)
+        if enable_logging:
+            wandb.log({"lr": optimizer.param_groups[0]["lr"]})
 
 
 if __name__ == "__main__":
-    os.environ["WANDB_KEY"] = "your_key"
-    os.environ["WANDB_PROJECT"] = "FacePoints_4"
-    os.environ["NAME"] = "First launch"
-    os.environ["WANDB_RUN_ID"] = os.getenv("NAME")
-    os.environ["WANDB_RESUME"] = "allow"
-
     import wandb
 
     wandb.login(key=os.environ["WANDB_KEY"])
-
     wandb.init(
-        project=os.getenv("WANDB_PROJECT"),
-        name=os.getenv("NAME"),
-        resume=os.getenv("WANDB_RESUME"),
-        id=os.getenv("WANDB_RUN_ID"),
+        project="FacePoints",
+        resume="allow",
     )
 
     train_detector(train_img_dir=r"./data/00_test_img_input/train/images",
                    coords_file=r"./data/00_test_img_input/train/gt.csv",
-                   checkpoint_dir="./checkpoints",
-                   input_shape=(128, 128),
-                   batch_size=64,
-                   lr=3e-4,
+                   input_shape=(100, 100),
+                   batch_size=32,
+                   lr=3e-2,
                    num_epochs=100,
                    fast_train=False,
                    enable_logging=True,
-                   enable_checkpointning=False,
+                   enable_checkpointning=True,
                    )
