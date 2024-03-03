@@ -536,7 +536,7 @@ class BatchNorm(Layer):
             mean = np.mean(inputs, axis=(0, 2, 3))
             var = np.var(inputs, axis=(0, 2, 3))
             self.update_running_params(mean, var)
-            self.forward_inverse_std = 1 / np.sqrt(var + 1e-8)[..., None, None]
+            self.forward_inverse_std = 1 / np.sqrt(var + eps)[..., None, None]
             self.forward_centered_inputs = inputs - mean[..., None, None]
             self.forward_normalized_inputs = self.forward_centered_inputs * self.forward_inverse_std
             return self.gamma[..., None, None] * self.forward_normalized_inputs + self.beta[..., None, None]
@@ -544,8 +544,8 @@ class BatchNorm(Layer):
             mean = self.running_mean.copy()
             var = self.running_var.copy()
             inv_std = 1 / np.sqrt(var + 1e-8)[..., None, None]
-            centered_input = inputs - mean[..., None, None]
-            inputs_norm = centered_input * inv_std
+            centered_inputs = inputs - mean[..., None, None]
+            inputs_norm = centered_inputs * inv_std
             return self.gamma[..., None, None] * inputs_norm + self.beta[..., None, None]
         # your code here /\
 
@@ -562,19 +562,19 @@ class BatchNorm(Layer):
         # your code here \/
         scaled_grad = self.gamma[..., None, None] * grad_outputs
         b, d, h, w = self.forward_inputs.shape
-        scale_coef = 0.5 * b * h * w + 1e-8
+        scale_coef = 2 / (b * h * w)
 
-        var_grad = -0.5 * self.forward_inverse_std ** 3 * np.sum(scaled_grad * self.forward_centered_inputs, axis=(0, 2, 3))[..., None, None]
+        var_grad = -0.5 * (self.forward_inverse_std ** 3) * np.sum(scaled_grad * self.forward_centered_inputs, axis=(0, 2, 3))[..., None, None]
 
         mean_grad = -self.forward_inverse_std * np.sum(scaled_grad, axis=(0, 2, 3))[..., None, None]
-        mean_grad -= var_grad * np.sum(self.forward_centered_inputs, axis=(0, 2, 3))[..., None, None] / scale_coef
+        mean_grad -= var_grad * np.sum(self.forward_centered_inputs, axis=(0, 2, 3))[..., None, None] * scale_coef
 
         self.gamma_grad = np.sum(grad_outputs * self.forward_normalized_inputs, axis=(0, 2, 3))
         self.beta_grad = np.sum(grad_outputs, axis=(0, 2, 3))
 
         return scaled_grad * self.forward_inverse_std + \
-            var_grad * self.forward_centered_inputs / scale_coef +\
-            mean_grad / scale_coef * 2
+            var_grad * self.forward_centered_inputs * scale_coef +\
+            mean_grad * (scale_coef / 2)
         # your code here /\
 
 
@@ -658,32 +658,30 @@ def train_cifar10_model(x_train, y_train, x_valid, y_valid):
     # your code here \/
     # 1) Create a Model
     loss = CategoricalCrossentropy()
-    opt = SGDMomentum(lr=1e-2, momentum=0.9)
+    opt = SGDMomentum(lr=1e-3, momentum=0.9)
     model = Model(loss, opt)
 
-    # 2) Add layers to the model
-    #   (don't forget to specify the input shape for the first layer)
-    model.add(Conv2D(6, 3, (3, 32, 32)))
+    # # 2) Add layers to the model
+    # #   (don't forget to specify the input shape for the first layer)
+    model.add(Conv2D(32, 3, (3, 32, 32)))
     model.add(ReLU())
-    model.add(BatchNorm())
+    model.add(Conv2D(64, 3))
+    model.add(ReLU())
     model.add(Pooling2D(2, 'max'))
-    model.add(Conv2D(16, 3))
-    model.add(ReLU())
     model.add(BatchNorm())
-    model.add(Conv2D(16, 3))
+
+    model.add(Conv2D(64, 3, (3, 32, 32)))
     model.add(ReLU())
-    model.add(BatchNorm())
+    model.add(Conv2D(32, 3))
+    model.add(ReLU())
     model.add(Pooling2D(2, 'max'))
-    model.add(Conv2D(8, 3))
-    model.add(ReLU())
     model.add(BatchNorm())
-    model.add(Pooling2D(2, 'max'))
+
     model.add(Flatten())
-    model.add(Dropout(0.2))
     model.add(Dense(512))
     model.add(ReLU())
     model.add(Dropout(0.2))
-    model.add(Dense(84))
+    model.add(Dense(120))
     model.add(ReLU())
     model.add(Dense(10))
     model.add(Softmax())
@@ -691,7 +689,7 @@ def train_cifar10_model(x_train, y_train, x_valid, y_valid):
     print(model)
 
     # 3) Train and validate the model using the provided data
-    model.fit(x_train, y_train, batch_size=32, epochs=3, x_valid=x_valid, y_valid=y_valid)
+    model.fit(x_train, y_train, batch_size=128, epochs=10, x_valid=x_valid, y_valid=y_valid)
 
     # your code here /\
     return model
