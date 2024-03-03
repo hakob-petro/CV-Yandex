@@ -1,7 +1,7 @@
 import os
 import random
 from pathlib import Path
-from typing import Tuple, Literal, Optional, Callable
+from typing import Tuple, Literal, Optional, Callable, Dict
 
 import cv2
 import numpy as np
@@ -18,7 +18,7 @@ torch.manual_seed(hash("by removing stochasticity") % 2 ** 32 - 1)
 torch.cuda.manual_seed_all(hash("so runs are repeatable") % 2 ** 32 - 1)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-CHECKPOINT_FILE = Path(os.path.join(os.path.abspath(os.path.dirname(__file__)), "facepoints_model.pt"))
+CHECKPOINT_FILE = Path(os.path.join(os.path.abspath(os.path.dirname(__file__)), "facepoints_model.chpt"))
 
 
 def print_trainable_parameters(model: torch.nn.Module) -> None:
@@ -34,11 +34,23 @@ def print_trainable_parameters(model: torch.nn.Module) -> None:
     )
 
 
+def get_coords_dict(coords_file: str):
+    img2coords = dict()
+    with open(coords_file) as f:
+        next(f)  # skip first row
+        for line in f:
+            parts = line.rstrip('\n').split(',')
+            curr_coords = [float(x) for x in parts[1:]]
+            curr_coords = np.array(curr_coords, dtype=np.float32)
+            img2coords.update({parts[0]: curr_coords})
+    return img2coords
+
+
 class FacePointDataset(Dataset):
     def __init__(self,
                  img_dir: str,
                  input_shape: Tuple[int, ...],
-                 coords_file: Optional[str] = None,
+                 train_gt: Optional[Dict[str, np.array]] = None,
                  mode: Literal["training", "validation", "inference"] = "training",
                  transform: Optional = None,
                  split: float = 0.01,
@@ -46,22 +58,13 @@ class FacePointDataset(Dataset):
                  ):
         self.img_dir = img_dir
         self.img_names = sorted(os.listdir(img_dir))
+        self.coords = train_gt
 
         self.transform = transform
         self.normalize_transform = A.Compose([A.Normalize(always_apply=True)])
 
         self.input_shape = input_shape
-        self.coords = dict()
         self.mode = mode
-
-        if mode in ["training", "validation"]:
-            with open(coords_file) as f:
-                next(f)  # skip first row
-                for line in f:
-                    parts = line.rstrip('\n').split(',')
-                    coords = [float(x) for x in parts[1:]]
-                    coords = np.array(coords, dtype=np.float32)
-                    self.coords.update({parts[0]: coords})
 
         if mode == "training":
             self.img_names = self.img_names[: int(split * len(self.img_names))]
@@ -197,6 +200,10 @@ class CustomResNet(nn.Module):
             nn.GELU(),
             nn.Dropout(p=0.2),
             nn.Linear(512, num_points)
+            # nn.BatchNorm1d(256),
+            # nn.GELU(),
+            # nn.Dropout(p=0.2),
+            # nn.Linear(256, num_points),
         )
 
         self.__init_layers(init_residual)
@@ -261,7 +268,7 @@ class CustomResNet(nn.Module):
 
 def get_dataloaders(
         train_img_dir: str,
-        coords_file: str,
+        train_gt: Dict[str, np.ndarray],
         input_shape: Tuple[int, int] = (96, 96),
         batch_size: int = 64,
         fast_train: bool = False) -> Tuple[DataLoader, DataLoader]:
@@ -277,13 +284,13 @@ def get_dataloaders(
             A.Solarize(p=0.2),
             A.RGBShift(r_shift_limit=12, g_shift_limit=12, b_shift_limit=12, p=0.2)
         ], p=0.8),
-    ], p=0.8, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
+    ], p=0.7, keypoint_params=A.KeypointParams(format='xy', remove_invisible=False))
 
     dataset_train = FacePointDataset(
         mode="training",
         input_shape=input_shape,
         img_dir=train_img_dir,
-        coords_file=coords_file,
+        train_gt=train_gt,
         transform=transforms,
         fast_train=fast_train,
         split=0.01 if fast_train else 0.9
@@ -293,7 +300,7 @@ def get_dataloaders(
         mode="validation",
         input_shape=input_shape,
         img_dir=train_img_dir,
-        coords_file=coords_file,
+        train_gt=train_gt,
         fast_train=fast_train,
         split=0.01 if fast_train else 0.9
     )
@@ -344,7 +351,7 @@ def load_checkpoint(model: torch.nn.Module,
         print("No checkpoints detected! Starting training from scratch!")
         return model, optimizer, 0, torch.inf
 
-    checkpoint = torch.load(CHECKPOINT_FILE)
+    checkpoint = torch.load(CHECKPOINT_FILE, map_location=torch.device('cpu'))
     model.to("cpu")
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(DEVICE)
@@ -354,8 +361,8 @@ def load_checkpoint(model: torch.nn.Module,
     return model, optimizer, epoch, loss
 
 
-def train_detector(train_img_dir: str,
-                   coords_file: str,
+def train_detector(train_gt: Dict[str, np.ndarray],
+                   train_img_dir: str,
                    fast_train: bool,
                    input_shape: Tuple[int, int] = (100, 100),
                    batch_size: int = 64,
@@ -365,13 +372,12 @@ def train_detector(train_img_dir: str,
                    logging_steps: int = 20,
                    enable_checkpointning: bool = False,
                    saving_steps: int = 50):
-    train_loader, val_loader = get_dataloaders(train_img_dir, coords_file, input_shape, batch_size, fast_train)
+    train_loader, val_loader = get_dataloaders(train_img_dir, train_gt, input_shape, batch_size, fast_train)
 
     model = CustomResNet([2, 2, 2, 2]).to(DEVICE)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=5)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.5, step_size=30)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=5)
 
     if fast_train:
         enable_checkpointning = False
@@ -453,9 +459,9 @@ def train_detector(train_img_dir: str,
             wandb.log({"lr": optimizer.param_groups[0]["lr"]})
 
 
-def detect(test_img_dir: str, input_shape: Tuple[int, int] = (100, 100), batch_size: int = 1):
+def detect(model_filename: str, test_img_dir: str, input_shape: Tuple[int, int] = (100, 100), batch_size: int = 1):
     model = CustomResNet([2, 2, 2, 2])
-    checkpoint = torch.load(CHECKPOINT_FILE)
+    checkpoint = torch.load(model_filename, map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(DEVICE)
 
@@ -463,15 +469,14 @@ def detect(test_img_dir: str, input_shape: Tuple[int, int] = (100, 100), batch_s
     inference_dataloader = DataLoader(inference_dataset, batch_size=batch_size, shuffle=False, num_workers=os.cpu_count())
 
     model.eval()
-
     preds = {}
     with torch.no_grad():
         for i, (img, scale_coeffs) in enumerate(inference_dataloader):
             img = img.to(DEVICE)
             coords = model(img)
             coords = coords.to("cpu")
-            coords[:, 0::2] *= scale_coeffs[:, 0]
-            coords[:, 1::2] *= scale_coeffs[:, 1]
+            coords[:, 0::2] *= scale_coeffs[0][..., None]
+            coords[:, 1::2] *= scale_coeffs[1][..., None]
             for j in range(batch_size):
                 preds[inference_dataset.img_names[i * batch_size + j]] = coords[j].numpy()
     return preds
@@ -484,11 +489,12 @@ if __name__ == "__main__":
     wandb.init(
         project="FacePoints",
         resume="allow",
-        name="lr_3e-2_b_32_steplr"
+        # name="lr_3e-2_b_32_steplr"
     )
 
+    img2coords = get_coords_dict(r"./data/00_test_img_input/train/gt.csv")
     train_detector(train_img_dir=r"./data/00_test_img_input/train/images",
-                   coords_file=r"./data/00_test_img_input/train/gt.csv",
+                   train_gt=img2coords,
                    input_shape=(100, 100),
                    batch_size=64,
                    lr=3e-2,
