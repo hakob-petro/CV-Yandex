@@ -1,0 +1,12 @@
+.idea/
+*/tests/
+*/public_tests/
+*.png
+*.jpg
+*.pdf
+*.zip
+*.npy
+*.pt
+*.pth
+*/.pytest_cache/
+*/__pycache__/
