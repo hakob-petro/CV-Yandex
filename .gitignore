@@ -5,9 +5,11 @@
 *.jpg
 *.pdf
 *.zip
+*.csv
 *.npy
 *.pt
 *.pth
+*.chpt
 */.pytest_cache/
 */__pycache__/
 */wandb/
