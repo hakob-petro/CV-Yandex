@@ -19,7 +19,7 @@ torch.manual_seed(hash("by removing stochasticity") % 2 ** 32 - 1)
 torch.cuda.manual_seed_all(hash("so runs are repeatable") % 2 ** 32 - 1)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-CHECKPOINT_FILE = Path(os.path.join(os.path.abspath(os.path.dirname(__file__)), "birds_model.pt"))
+CHECKPOINT_FILE = Path(os.path.join(os.path.abspath(os.path.dirname(__file__)), "birds_model.chpt"))
 
 
 def print_trainable_parameters(model: torch.nn.Module) -> None:
@@ -91,7 +91,6 @@ class BirdDataset(Dataset):
             bird_class = self.classes[self.img_names[i]]
             return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1), torch.tensor(bird_class)
         else:
-
             return torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1)
 
 
@@ -154,14 +153,14 @@ def get_dataloaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        num_workers=os.cpu_count(),
+        num_workers=1,
         shuffle=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        num_workers=os.cpu_count(),
+        num_workers=1,
         shuffle=False
     )
 
@@ -234,7 +233,7 @@ def train_classifier(train_gt: Dict[str, int],
                      train_img_dir: str,
                      fast_train: bool,
                      input_shape: Tuple[int, int] = (244, 244),
-                     batch_size: int = 64,
+                     batch_size: int = 8,
                      lr: float = 3e-4,
                      num_epochs: int = 20,
                      enable_logging: bool = False,
@@ -338,7 +337,7 @@ def classify(model_filename: str, test_img_dir: str, input_shape: Tuple[int, int
     model.to(DEVICE)
 
     inference_dataset = BirdDataset(mode="inference", input_shape=input_shape, img_dir=test_img_dir)
-    inference_dataloader = DataLoader(inference_dataset, batch_size=batch_size, shuffle=False, num_workers=os.cpu_count())
+    inference_dataloader = DataLoader(inference_dataset, batch_size=batch_size, shuffle=False, num_workers=1)
 
     model.eval()
     preds = {}
@@ -353,7 +352,7 @@ def classify(model_filename: str, test_img_dir: str, input_shape: Tuple[int, int
     return preds
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
 #     import wandb
 #
 #     wandb.login(key=os.environ["WANDB_KEY"])
@@ -375,7 +374,7 @@ def classify(model_filename: str, test_img_dir: str, input_shape: Tuple[int, int
 #                      enable_checkpointning=True,
 #                      )
 #
-#     preds = classify("./birds_model.pt", r"./data/00_test_img_input/test/images")
-#     print(preds)
-#     print(type(preds))
+    preds = classify("./birds_model.ckpt", r"./data/00_test_img_input/test/images")
+    print(preds)
+    print(type(preds))
 
