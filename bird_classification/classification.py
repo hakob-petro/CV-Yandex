@@ -238,12 +238,12 @@ def train_classifier(train_gt: Dict[str, int],
                      lr: float = 3e-4,
                      num_epochs: int = 20,
                      enable_logging: bool = False,
-                     logging_steps: int = 20,
                      enable_checkpointning: bool = False,
                      saving_steps: int = 50):
     train_loader, val_loader = get_dataloaders(train_img_dir, train_gt, input_shape, batch_size, fast_train=fast_train)
 
-    model = get_model(50, use_pretrained_weights=True).to(DEVICE)
+    use_pretrained_weights = False if fast_train else True
+    model = get_model(50, use_pretrained_weights=use_pretrained_weights).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.3, patience=5)
