@@ -10,6 +10,7 @@
 *.pt
 *.pth
 *.chpt
+*.pickle
 */.pytest_cache/
 */__pycache__/
 */wandb/
